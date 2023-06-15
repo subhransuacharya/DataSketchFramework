@@ -1,61 +1,100 @@
-package com.ljmu.subhransu.core.histogram
+package com.ljmu.subhransu.core.sampling
 
+import com.ljmu.subhransu.core.AbstractDistributedSketchFramework
 import org.apache.datasketches.ArrayOfStringsSerDe
 import org.apache.datasketches.memory.Memory
-import org.apache.datasketches.quantiles.{DoublesSketch, DoublesUnion, ItemsSketch, ItemsUnion, UpdateDoublesSketch}
-import org.apache.spark.sql.{DataFrame, Encoder}
+import org.apache.datasketches.sampling.{ReservoirItemsSketch, ReservoirItemsUnion}
+import org.apache.spark.sql.{DataFrame, Dataset}
 
-import java.util.Comparator
-
-case class HistogramSketch(){
+object SamplingSketch extends AbstractDistributedSketchFramework[ReservoirItemsSketch[String]]{
   val k = 32768
 
-  implicit val myObjEncoder: Encoder[Array[Byte]] = org.apache.spark.sql.Encoders.kryo[Array[Byte]]
-
-  def calculateHistogram(data: DataFrame, column: String): String = {
+  def calculateSamples(data: DataFrame, column: String): String = {
     val mappedData = data.mapPartitions(iterator => {
-      val doublesSketch: UpdateDoublesSketch = DoublesSketch.builder().build()
+      val reservoirSketch: ReservoirItemsSketch[String] = ReservoirItemsSketch.newInstance(k)
       iterator.foreach(
         row => {
-          doublesSketch.update(String.valueOf(row.getAs[String](column)).toDouble)
+          reservoirSketch.update(String.valueOf(row.getAs[String](column)))
         }
       )
-      List(doublesSketch.toByteArray()).iterator
+      List(reservoirSketch.toByteArray(new ArrayOfStringsSerDe)).iterator
     })
 
     val finalSketchByteArray: Array[Byte] = mappedData.reduce((barray1, barray2) => {
-      val doublesSketch1 = DoublesSketch.wrap(Memory.wrap(barray1))
-      val doublesSketch2 = DoublesSketch.wrap(Memory.wrap(barray2))
-      if (doublesSketch1 == null && doublesSketch2 == null) {
-        DoublesSketch.builder().build().toByteArray()
+      val reservoirSketch1 = ReservoirItemsSketch.heapify(Memory.wrap(barray1), new ArrayOfStringsSerDe)
+      val reservoirSketch2 = ReservoirItemsSketch.heapify(Memory.wrap(barray2), new ArrayOfStringsSerDe)
+      if (reservoirSketch1 == null && reservoirSketch2 == null) {
+        ReservoirItemsSketch.newInstance(k).toByteArray(new ArrayOfStringsSerDe)
       }
 
-      if(doublesSketch1 == null)
-        doublesSketch2.toByteArray()
-      if(doublesSketch2 == null)
-        doublesSketch1.toByteArray()
+      if(reservoirSketch1 == null)
+        reservoirSketch2.toByteArray(new ArrayOfStringsSerDe)
+      if(reservoirSketch2 == null)
+        reservoirSketch1.toByteArray(new ArrayOfStringsSerDe)
 
-      val union: DoublesUnion = DoublesUnion.builder().build()
+      val union: ReservoirItemsUnion[String] = ReservoirItemsUnion.newInstance(k)
 
-      union.update(doublesSketch1)
-      union.update(doublesSketch2)
-      union.toByteArray
+      union.update(reservoirSketch1)
+      union.update(reservoirSketch2)
+      union.getResult.toByteArray(new ArrayOfStringsSerDe)
     }
     )
-    val finalUpdateSketch = DoublesSketch.wrap(Memory.wrap(finalSketchByteArray))
+    val finalUpdateSketch: ReservoirItemsSketch[String] = ReservoirItemsSketch.heapify(Memory.wrap(finalSketchByteArray), new ArrayOfStringsSerDe)
     println(finalUpdateSketch)
 
-    println("Min, Skewness, Max Values")
-    println(finalUpdateSketch.getQuantiles(Array(0.0, 0.5, 1.0)).mkString("Array(", ", ", ")"))
+    println("First 10 results in union")
+    finalUpdateSketch.getSamples().take(10).foreach(
+      sample => println(">->> " + sample)
+    )
 
-    println("Probability Histogram: Estimated Probability Mass in 4 bins (-inf, -2) (-2, 0) (0, 2) (2, inf)")
-    println(finalUpdateSketch.getPMF(Array(-2, 0, 2)).mkString("Array(", ", ", ")"))
-
-    println("Frequency Histogram: Estimated number of original values in same bins")
-    val hist = finalUpdateSketch.getPMF(Array(-2, 0, 2))
-    hist.foreach(d => println(">->" + (d*finalUpdateSketch.getN)))
-
-    finalUpdateSketch.getMaxValue.toString
+    finalUpdateSketch.getNumSamples.toString
   }
 
+  override protected def processPartitionedSketches(dataFrame: DataFrame, column: String): Dataset[Array[Byte]] = {
+    dataFrame.mapPartitions(iterator => {
+      val reservoirSketch: ReservoirItemsSketch[String] = ReservoirItemsSketch.newInstance(k)
+      iterator.foreach(
+        row => {
+          reservoirSketch.update(String.valueOf(row.getAs[String](column)))
+        }
+      )
+      List(reservoirSketch.toByteArray(new ArrayOfStringsSerDe)).iterator
+    })
+  }
+
+  override protected def reduceSketches(partiallyCalculatedDf: Dataset[Array[Byte]]): Array[Byte] = {
+    partiallyCalculatedDf.reduce((barray1, barray2) => {
+      val reservoirSketch1 = ReservoirItemsSketch.heapify(Memory.wrap(barray1), new ArrayOfStringsSerDe)
+      val reservoirSketch2 = ReservoirItemsSketch.heapify(Memory.wrap(barray2), new ArrayOfStringsSerDe)
+      if (reservoirSketch1 == null && reservoirSketch2 == null) {
+        ReservoirItemsSketch.newInstance(k).toByteArray(new ArrayOfStringsSerDe)
+      }
+
+      if(reservoirSketch1 == null)
+        reservoirSketch2.toByteArray(new ArrayOfStringsSerDe)
+      if(reservoirSketch2 == null)
+        reservoirSketch1.toByteArray(new ArrayOfStringsSerDe)
+
+      val union: ReservoirItemsUnion[String] = ReservoirItemsUnion.newInstance(k)
+
+      union.update(reservoirSketch1)
+      union.update(reservoirSketch2)
+      union.getResult.toByteArray(new ArrayOfStringsSerDe)
+    }
+    )
+  }
+
+  override protected def calculateSketch(finalByteArray: Array[Byte]): ReservoirItemsSketch[String] = {
+    ReservoirItemsSketch.heapify(Memory.wrap(finalByteArray), new ArrayOfStringsSerDe)
+  }
+
+  override def printReport(sketch: ReservoirItemsSketch[String]): Unit = {
+    println()
+    println("SamplingSketch-------------")
+    println("First 10 results in the sample pool")
+    sketch.getSamples().take(10).foreach(
+      sample => println(sample)
+    )
+    println("================================")
+  }
 }

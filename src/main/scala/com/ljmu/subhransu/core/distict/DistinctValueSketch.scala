@@ -1,15 +1,14 @@
 package com.ljmu.subhransu.core.distict
 
+import com.ljmu.subhransu.core.AbstractDistributedSketchFramework
 import org.apache.datasketches.memory.Memory
-import org.apache.datasketches.theta.{CompactSketch, SetOperation, Sketches, UpdateSketch}
-import org.apache.spark.sql.{DataFrame, Encoder}
+import org.apache.datasketches.theta.{SetOperation, Sketch, Sketches, UpdateSketch}
+import org.apache.spark.sql.{DataFrame, Dataset}
 
-case class CustomSketchImpl() {
+object DistinctValueSketch extends AbstractDistributedSketchFramework[Sketch]{
 
-  implicit val myObjEncoder: Encoder[Array[Byte]] = org.apache.spark.sql.Encoders.kryo[Array[Byte]]
-
-  def getDistinctCount(data: DataFrame, column: String): Double = {
-    val mappedData = data.mapPartitions(iterator => {
+  def calculateDistinctCount(data: DataFrame, column: String): Double = {
+    val mappedData: Dataset[Array[Byte]] = data.mapPartitions(iterator => {
       val updateSketch = UpdateSketch.builder().build()
       iterator.foreach(
         row => {
@@ -20,25 +19,67 @@ case class CustomSketchImpl() {
     })
 
     val finalSketchByteArray: Array[Byte] = mappedData.reduce((barray1, barray2) => {
-      val tsk1 = Sketches.wrapSketch(Memory.wrap(barray1))
-      val tsk2 = Sketches.wrapSketch(Memory.wrap(barray2))
-      if (tsk1 == null && tsk2 == null) {
+      val thetaSketch1 = Sketches.wrapSketch(Memory.wrap(barray1))
+      val thetaSketch2 = Sketches.wrapSketch(Memory.wrap(barray2))
+      if (thetaSketch1 == null && thetaSketch2 == null) {
         UpdateSketch.builder.build.compact().toByteArray
       }
 
-      if(tsk1 == null)
-        tsk2.compact().toByteArray
-      if(tsk2 == null)
-        tsk1.compact().toByteArray
+      if(thetaSketch1 == null)
+        thetaSketch2.compact().toByteArray
+      if(thetaSketch2 == null)
+        thetaSketch1.compact().toByteArray
 
       val union = SetOperation.builder().buildUnion()
-      val sketch = union.union(tsk1,tsk2)
+      val sketch = union.union(thetaSketch1,thetaSketch2)
       sketch.compact().toByteArray
     }
     )
-    val finalUpdateSketch = Sketches.wrapSketch((Memory.wrap(finalSketchByteArray)))
+    val finalUpdateSketch: Sketch = Sketches.wrapSketch((Memory.wrap(finalSketchByteArray)))
     println(finalUpdateSketch)
     finalUpdateSketch.getEstimate
   }
 
+  override protected def processPartitionedSketches(dataFrame: DataFrame, column: String): Dataset[Array[Byte]] = {
+    dataFrame.mapPartitions(iterator => {
+      val updateSketch = UpdateSketch.builder().build()
+      iterator.foreach(
+        row => {
+          updateSketch.update(row.getAs[String](column))
+        }
+      )
+      List(updateSketch.compact().toByteArray).iterator
+    })
+  }
+
+  override protected def reduceSketches(partiallyCalculatedDf: Dataset[Array[Byte]]): Array[Byte] = {
+    partiallyCalculatedDf.reduce((barray1, barray2) => {
+      val thetaSketch1 = Sketches.wrapSketch(Memory.wrap(barray1))
+      val thetaSketch2 = Sketches.wrapSketch(Memory.wrap(barray2))
+      if (thetaSketch1 == null && thetaSketch2 == null) {
+        UpdateSketch.builder.build.compact().toByteArray
+      }
+
+      if(thetaSketch1 == null)
+        thetaSketch2.compact().toByteArray
+      if(thetaSketch2 == null)
+        thetaSketch1.compact().toByteArray
+
+      val union = SetOperation.builder().buildUnion()
+      val sketch = union.union(thetaSketch1,thetaSketch2)
+      sketch.compact().toByteArray
+    }
+    )
+  }
+
+  override protected def calculateSketch(finalByteArray: Array[Byte]): Sketch = {
+    Sketches.wrapSketch((Memory.wrap(finalByteArray)))
+  }
+
+  override def printReport(sketch: Sketch) = {
+    println()
+    println("DistinctValueSketch-------------")
+    println("Number of estimated Distinct Values are: " + sketch.getEstimate)
+    println("================================")
+  }
 }
